@@ -34,23 +34,21 @@ library(tm)
 # system.time(sg <- spinglass.community(g_big))           # didn't run
 
 ###############################################################################
-matching_edge <- function(g1,e,g2) {
-  # given an edge e in g1, return the corresponding edge in g2
-  name1 <- V(g1)[get.edges(g1,e)[1,1]]$name
-  name2 <- V(g1)[get.edges(g1,e)[1,2]]$name
-  E(g2)[get.edge.ids(g2,c(name1,name2))]
-}
-
-
-###############################################################################
-mayors <- function(g,c,n=8,metric=page.rank) {
+mayors <- function(g,comm,n=8,metric=page.rank,extra=NULL) {
   # for a community breakdown c of a graph g, return the mayors of the top n
   # communities
-  if (max(membership(c)) < n) {
-    n <- max(membership(c))
+  if (max(membership(comm)) < n) {
+    n <- max(membership(comm))
   }
-  sapply(1:n,function(i) {
-    vi <- V(g)[membership(c)==i]
+  t_all <- membership(comm) %>% table() %>% as.data.frame()
+  t_all <- t_all[order(t_all$Freq,decreasing=TRUE),] 
+  t <- head(t_all,n)
+  for (i in 1:length(extra)) {
+    t <- rbind(t,t_all[t_all$.==extra[i],])
+  }
+  res <- sapply(1:nrow(t),function(i) {
+    cnum <- t[i,1]
+    vi <- V(g)[membership(comm)==cnum]
     gi <- induced.subgraph(g,vi)
     scores <- metric(gi)
     if ('vector' %in% names(scores)) { # account for different metrics
@@ -58,12 +56,14 @@ mayors <- function(g,c,n=8,metric=page.rank) {
     }
     names(scores)[which.max(scores)]
   })
+  names(res) <- as.character(t[,1])
+  res
 }
 
 # mayors(g,fg) 
 
 ###############################################################################
-community_plot <- function(g,c,n=8,layout=NULL,showMayors=TRUE) {
+community_plot <- function(g,c,n=8,layout=NULL,showMayors=TRUE,extra=NULL) {
   # plot a graph g using a community breakdown c
   # color in the first n communities
   if (is.null(layout)) {
@@ -72,22 +72,30 @@ community_plot <- function(g,c,n=8,layout=NULL,showMayors=TRUE) {
   if (max(membership(c)) < n) {
     n <- max(membership(c))
   }
-  col_n <- brewer.pal(n,'Dark2')
-  E(g)$color <- "gray"  
+  t_all <- membership(c) %>% table() %>% as.data.frame()
+  t_all <- t_all[order(t_all$Freq,decreasing=TRUE),] 
+  t <- head(t_all,n)
+  for (i in 1:length(extra)) {
+    t <- rbind(t,t_all[t_all$.==extra[i],])
+  }
+  col_n <- brewer.pal(nrow(t),'Dark2')
   V(g)$shape <- "none"
   V(g)$size <- 0
   V(g)$color <- "gray"
-  for (i in 1:n) {
-    vi <- V(g)[membership(c)==i]
-    gi <- induced.subgraph(g,vi)
-    for (e in E(gi)) {
-      eg <- matching_edge(gi,e,g)
-      E(g)[eg]$color <- col_n[i]
-    }
+  source_nodes <- tail_of(g,E(g))
+  target_nodes <- head_of(g,E(g))
+  source_m <- membership(c)[source_nodes]
+  target_m <- membership(c)[target_nodes]
+  both_m <- rep(-1,length(E(g)))
+  both_m[source_m==target_m] <- source_m[source_m==target_m]
+  edge_colors <- rep("gray",length(E(g)))
+  for (i in 1:nrow(t)) {
+    edge_colors[both_m==t[i,1]] <- col_n[i]
   }
+  E(g)$color <- edge_colors
   if (showMayors) {
-    m <- mayors(g,c)
-    for (i in 1:n) {
+    m <- mayors(g,c,n=n,extra=extra)
+    for (i in 1:length(m)) {
       x <- m[i]
       V(g)[x]$shape <- "circle"
       V(g)[x]$size <- 4
@@ -114,11 +122,13 @@ community_plot <- function(g,c,n=8,layout=NULL,showMayors=TRUE) {
 # g_layout <- layout.fruchterman.reingold(g)
 # community_plot(g,fg,layout=g_layout)
 
+
 ###############################################################################
 ws_to_dtm <- function(ws) {
   # Beginning with an Excel worksheet from Crimson Hexagon, generate a 
-  # document-term matrix in which urls, excess whitespace, punctuation, and 
+  # document-term matrix in which urls, excess whitespace, most punctuation, and 
   # English stopwords have been removed.
+  # Keeping '@' and '#' characters because of their special Twitter meaning.
   # Also convert to lowercase and keep only terms appearing in 0.01% or more
   # of documents.
   corpus <- VCorpus(VectorSource(ws$Contents))
@@ -126,31 +136,50 @@ ws_to_dtm <- function(ws) {
   corpus <- tm_map(corpus,no_url)
   corpus <- tm_map(corpus,stripWhitespace)
   corpus <- tm_map(corpus,content_transformer(tolower))
-  corpus <- tm_map(corpus,removePunctuation)
+  # This doesn't work quite right yet
+  mostPunct <- content_transformer(function(x) 
+    gsub('[!"$%&\'()*+\\,\\.\\/:;<=>?\\^_`\\{\\|\\}~]',' ',x))
+  corpus <- tm_map(corpus,mostPunct)
+  #corpus <- tm_map(corpus,removePunctuation)
   corpus <- tm_map(corpus, removeWords, stopwords('english'))
   dtm <- DocumentTermMatrix(corpus)
   removeSparseTerms(dtm,0.999) 
 }
-
 ###############################################################################
-cluster_dtm <- function(dtm,c) {
-  # given a document-term matrix and a community breakdown, aggregate documents
-  # to return a new dtm with only one document per community. 
+cluster_dtm <- function(dtm,c,ws) {
+  # use this to save time if you'll be runninng community_topics() repeatedly
   m <- as.matrix(dtm)
+  clust_assign <- membership(c)[ws$Author]
+  clust_assign[is.na(clust_assign)] <- -1
   cluster.list <- by(m, clust_assign, colSums)
   cluster.dtm <- matrix(unlist(cluster.list), nrow = length(cluster.list), byrow = T)
   colnames(cluster.dtm) <- names(cluster.list[[1]])
   rownames(cluster.dtm) <- names(cluster.list)
-  as.DocumentTermMatrix(cluster.dtm,weighting=weightTf)
+  cluster.dtm
 }
 
+
 ###############################################################################
-community_topics <- function(dtm,c,n=8,num_keywords=10) {
+community_topics <- function(c,ws,dtm=NULL,n=8,num_keywords=10,extra=NULL,
+                             cdtm=NULL) {
+  # given a document-term matrix and a community breakdown, aggregate documents
+  # to return a new dtm with only one document per community. 
   # For each of the top n communities in a clustered dtm, output the terms
   # with the highest TF-IDF weight
-  dtm_w <- weightTfIdf(dtm)
-  t <- membership(c) %>% table() %>% as.data.frame()
-  t <- t[order(t$Freq,decreasing=TRUE),] %>% head(.,n)
+  if (is.null(dtm) & is.null(cdtm)) {
+    print('ERROR in community_topics(): Must specify either dtm or cdtm!')
+    return(NULL)
+  }
+  if (is.null(cdtm)) {
+    cdtm <- cluster_dtm(dtm,c,ws)
+  }
+  t_all <- membership(c) %>% table() %>% as.data.frame()
+  t_all <- t_all[order(t_all$Freq,decreasing=TRUE),] 
+  t <- head(t_all,n)
+  for (i in 1:length(extra)) {
+    t <- rbind(t,t_all[t_all$.==extra[i],])
+  }
+  dtm_w <- as.DocumentTermMatrix(cdtm,weighting=weightTf) %>% weightTfIdf()
   res <- sapply(t$.,function(x) {
     row <- data.frame(name=colnames(dtm_w),
                       val=t(as.matrix(dtm_w[as.character(x),])))
